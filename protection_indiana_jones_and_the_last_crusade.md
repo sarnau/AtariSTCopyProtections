@@ -9,6 +9,19 @@ categories:
 
 Another protection that measures the length of track 79, which has to be smaller than 6020 byte. The copy station created them bit a lower bitrate, on a standard floppy these tracks can not be written.
 
+The game is `AUTO\INDY.PRG` on disk 1 (Tiertex/U.S. Gold, 1989) - not to be confused with the
+LucasArts SCUMM adventure of the same name, which is the one with the red filter and the printed
+translation table. This action game has no manual protection at all: the only user visible strings
+in the whole 59494 byte executable are the credits, the high score table, `PLEASE ENTER YOUR NAME`
+and `PLACE DISK 2 INTO DRIVE A AND PRESS FIRE`.
+
+`checkProtection` runs from the title screen sequence, *after* the game has asked you to swap in
+disk 2, and `fdcSelect` hard-selects drive A. So the track that actually gets verified is the one on
+**disk 2** - which is why both disks carry the same protected track 79.
+
+Track 78 is read first and its length is stored, but never looked at again - a head settle/spin-up
+warm-up, or a decoy.
+
 ``` 68k
 0001885a: 6100 0068                      BSR      fdcSelect
 0001885e: 6100 0082                      BSR      fdcRestore
@@ -126,4 +139,108 @@ fdcReadTrack
 
 000189F6: DC.L 0
 000189FA: DS.B buffersize
+```
+
+## Where it is called from
+
+``` 68k
+titleScreen
+0001af04: 41f9 0000 2d04                 LEA      $FBBE,A0          ;"GRAPHICS\TITLE.PC1"
+0001af0a: 43f9 0005 4000                 LEA      $54000,A1
+0001af10: 203c 0000 7d2c                 MOVE.L   #$7D2C,D0
+0001af16: 4eb9 0000 281c                 JSR      loadFile
+
+0001af1c: 41f9 0000 2d17                 LEA      $FBD1,A0          ;"GRAPHICS\INTRO.PC1"
+0001af22: 43f9 0005 bfde                 LEA      $5BFDE,A1
+0001af28: 203c 0000 7d2c                 MOVE.L   #$7D2C,D0
+0001af2e: 4eb9 0000 281c                 JSR      loadFile
+
+0001af34: 4eb9 0000 b9a0                 JSR      checkProtection
+0001af3a: 4a40                           TST.W    D0
+0001af3c: 6700 000c                      BEQ      titleScreenGo     ;original: leave the vector alone
+0001af40: 23fc 0000 e090 0000 948c       MOVE.L   #$1AF4A,$16346    ;copy: poison the chain
+
+titleScreenGo
+0001af4a: 33fc 0001 0000 e018            MOVE.W   #1,$1AED2
+```
+
+## What happens on a copy
+
+Nothing - and that is the point. On an original, `checkProtection` returns 0 and the routine simply
+does nothing at all. On a copy it returns 1 and a single long word is written into the middle of the
+Timer B raster interrupt below, at `$16346`. That long word is the operand of the `JMP` that ends the
+routine. It is deliberately *not* in the relocation table - the `$1F000` in the file is only a placeholder.
+At runtime that long word holds the previously installed vector, so the handler chains onwards
+(`$FC06C0` was there under TOS 1.04). Overwriting it with `titleScreenGo` sends the interrupt into
+the tail of the title screen code, which is not an interrupt handler and ends in an `RTS`. The check
+itself passes silently; the machine dies later, with a bus error, a long way away from it.
+
+``` 68k
+installTimerB
+000162f8: 13fc 0000 00ff fa1b            MOVE.B   #0,$FFFFFA1B
+00016300: 23f9 0000 93ae 0000 0120       MOVE.L   $16268,$120       ;Timer B vector
+0001630a: 48e7 80c0                      MOVEM.L  D0/A0-A1,-(A7)
+0001630e: 3039 0000 93ac                 MOVE.W   $16266,D0
+waitRaster
+00016314: 13c0 00ff fa21                 MOVE.B   D0,$FFFFFA21      ;raster line to split on
+0001631a: b039 00ff fa21                 CMP.B    $FFFFFA21,D0
+00016320: 6600 fff2                      BNE      waitRaster
+00016324: 13fc 0008 00ff fa1b            MOVE.B   #8,$FFFFFA1B
+0001632c: 2079 0000 209c                 MOVEA.L  $EF56,A0          ;palette pointer
+00016332: 43f9 00ff 8240                 LEA      $FFFF8240,A1
+00016338: 700f                           MOVEQ    #15,D0
+setPalette
+0001633a: 32d8                           MOVE.W   (A0)+,(A1)+
+0001633c: 51c8 fffc                      DBF      D0,setPalette
+00016340: 4cdf 0301                      MOVEM.L  (A7)+,D0/A0-A1
+00016344: 4ef9 0001 f000                 JMP      $0001F000         ;not relocated! overwritten at startup
+0001634a: 4e73                           RTE
+```
+
+## Verified in Hatari
+
+Breakpoint on the `CMP.L` at `$1888C`, with the game booted from disk 1 and disk 2 swapped into
+drive A:
+
+| disk 2 in drive A                        | D0            | result                                |
+| ---------------------------------------- | ------------- | ------------------------------------- |
+| original `.STX` (track 79 = 5982 byte)    | `$1750` = 5968 | <= 6020, returns 0, game runs         |
+| plain `.ST` sector copy (standard track)  | `$1870` = 6256 | > 6020, returns 1, vector poisoned -> bus error |
+
+A trace of the whole boot-to-gameplay run (`--trace fdc`) contains exactly two type III `READ TRACK`
+commands, for tracks `$4E` and `$4F`, and nothing else out of the ordinary - no `READ ADDRESS`, and
+no repeated reads of the weak sector that Pasti flags on track 79, sector 6.
+
+## Unrelated: the IEHOVA cheat
+
+Sitting right next to the protection call is a cheat that is checked on the title screen. Type
+**I E H O V A** - the Latin spelling from the Grail floor puzzle - and `$EF70` is set to $FF.
+With the cheat active, `I` skips a level, `RETURN` restarts the game and `ESC` reboots the machine.
+(A test of F2 at `$F2A4` branches to the instruction that follows it anyway, so that one was
+neutered before release.)
+
+``` 68k
+iehovaKeys
+0001b02a: 1712 2318 2f1e                 DC.B     $17,$12,$23,$18,$2F,$1E; "IEHOVA"
+
+checkIehova
+0001b032: 4dfa fff6                      LEA      iehovaKeys(PC),A6
+0001b036: 47f9 0000 299e                 LEA      keyMatrix,A3      ;keyboard matrix, $FF = key down
+...
+0001b0d8: 33fc 00ff 0000 20b6            MOVE.W   #$FF,$EF70        ;all six typed in order: cheat on
+0001b0e0: 33fc 0333 00ff 8240            MOVE.W   #$333,$FF8240     ;flash the background
+
+cheatKeys
+0000f296: 4a79 0000 20b6                 TST.W    $EF70             ;cheat active?
+0000f29c: 6700 ff58                      BEQ      normalKeys
+0000f2a0: 41fa 05b6                      LEA      keyMatrix(PC),A0
+...
+0000f2c8: 4a28 0017                      TST.B    23(A0)            ;"I" - skip a level
+0000f2cc: 6700 0010                      BEQ      $F2DE
+0000f2d0: 5279 0000 20d8                 ADDQ.W   #1,$EF92
+0000f2d6: 6100 67b2                      BSR      nextLevel
+0000f2da: 6000 ff1a                      BRA      normalKeys
+0000f2de: 4a28 001c                      TST.B    28(A0)            ;RETURN - restart the game
+0000f2e2: 6600 fd32                      BNE      $F016
+0000f2e6: 4a28 0001                      TST.B    1(A0)             ;ESC - reboot the machine
 ```
